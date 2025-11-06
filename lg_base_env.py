@@ -1,175 +1,203 @@
-# lg_base_env.py
-from __future__ import annotations
-
-from dataclasses import dataclass, field
-from typing import Any, Callable, Dict, List, Optional, TypedDict, Literal
-from typing_extensions import NotRequired
+# lg_no_agents.py
+from dataclasses import dataclass
+from typing import Any, Callable, Dict, List, Optional, Literal
 from pydantic import BaseModel
-from langgraph.graph import StateGraph, END
 
-# =========================
-# Domain models (base only)
-# =========================
 @dataclass
 class UserAccount:
+    """
+    Minimal domain object representing a bank/user account.
+
+    Attributes:
+        user_id: Stable identifier for the account owner.
+        balance: Current balance in arbitrary currency units.
+        domain_tag: Optional classification label to support domain scoping
+                   (useful if you later add cross-domain policies).
+    """
     user_id: str
     balance: float
     domain_tag: str = "Finance-Sensitive"
 
-# In-memory store (placeholder data)
 ACCOUNTS: Dict[str, UserAccount] = {
     f"user{i}": UserAccount(user_id=f"user{i}", balance=1000.0 + 100 * i)
     for i in range(1, 6)
 }
 
-# =========================
-# Tool registry (skeleton)
-# =========================
+# Identities / Roles
+
+@dataclass
+class AgentIdentity:
+    """
+    Identity and authorization attributes for an agent (caller).
+
+    Attributes:
+        agent_id: Stable name of the agent (e.g., "AgentA", "AgentB").
+        role: Either "finance" (high privilege) or "customer_service" (low privilege).
+        assigned_customers: For customer_service agents, the subset of user_ids
+                            they are allowed to access (RBAC + ABAC hybrid).
+    """
+    agent_id: str
+    role: Literal["finance", "customer_service"]
+    assigned_customers: List[str]
+
+IDENTITIES: Dict[str, AgentIdentity] = {
+    "AgentA": AgentIdentity(agent_id="AgentA", role="finance", assigned_customers=[]),
+    "AgentB": AgentIdentity(agent_id="AgentB", role="customer_service", assigned_customers=["user1", "user2"]),
+}
+
+# Tools (including extra stubs)
+def read_balance(args: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Tool: read the balance for a single user.
+
+    Args structure:
+        {"user_id": "<id>"}
+
+    Returns:
+        {"user_id": str, "balance": float, "domain_tag": str}
+
+    Raises:
+        ValueError: if the user doesn't exist.
+    """
+    uid = args.get("user_id")
+    if uid not in ACCOUNTS:
+        raise ValueError("user not found")
+    acct = ACCOUNTS[uid]
+    return {"user_id": uid, "balance": acct.balance, "domain_tag": acct.domain_tag}
+
+def transfer(args: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Tool: transfer balance between two accounts.
+
+    Args structure:
+        {
+          "from_user": str,
+          "to_user": str,
+          "amount": number
+        }
+
+    Returns:
+        {"status": "ok" | "insufficient_funds", "from_user": ..., "to_user": ..., "amount": float}
+
+    Raises:
+        ValueError: on invalid accounts or non-positive amounts.
+    """
+    from_user = args.get("from_user")
+    to_user = args.get("to_user")
+    amount = float(args.get("amount", 0))
+    if amount <= 0:
+        raise ValueError("amount must be > 0")
+    if from_user not in ACCOUNTS or to_user not in ACCOUNTS:
+        raise ValueError("invalid accounts")
+    if ACCOUNTS[from_user].balance < amount:
+        return {"status": "insufficient_funds"}
+    ACCOUNTS[from_user].balance -= amount
+    ACCOUNTS[to_user].balance += amount
+    return {"status": "ok", "from_user": from_user, "to_user": to_user, "amount": amount}
+
+# Additional tools requested in your spec (stubs)
+def read_ticket_history(args: Dict[str, Any]) -> Dict[str, Any]:
+    # stub: would normally query ticket DB; return synthetic ticket list for user
+    user_id = args.get("user_id")
+    return {"user_id": user_id, "tickets": [{"id": "T1", "status": "open"}, {"id": "T2", "status": "closed"}]}
+
+def send_email(args: Dict[str, Any]) -> Dict[str, Any]:
+    # stub: send an email (just returns a success artifact)
+    return {"status": "sent", "to": args.get("to"), "subject": args.get("subject")}
+
+TOOL_REGISTRY: Dict[str, Callable[[Dict[str, Any]], Any]] = {
+    "readBalance": read_balance,
+    "transfer": transfer,
+    "read_ticket_history": read_ticket_history,
+    "send_email": send_email,
+}
+
+# -------------------------
+# Security middleware
+# -------------------------
 class ToolCall(BaseModel):
     tool: str
     args: Dict[str, Any]
 
-# Registry type: name -> callable(args)->result
-ToolFn = Callable[[Dict[str, Any]], Any]
-TOOL_REGISTRY: Dict[str, ToolFn] = {}
-
-# Example stubs (you can wire real functions later)
-def _read_balance_stub(args: Dict[str, Any]) -> Dict[str, Any]:
-    """Stub: replace with real implementation later."""
-    uid = args.get("user_id")
-    if uid not in ACCOUNTS:
-        raise ValueError("user not found")
-    return {"user_id": uid, "balance": ACCOUNTS[uid].balance}
-
-def _transfer_stub(args: Dict[str, Any]) -> Dict[str, Any]:
-    """Stub: replace with real implementation later."""
-    return {"status": "noop", "note": "transfer not implemented in base model"}
-
-# Register stubs (can be replaced when you implement real tools)
-TOOL_REGISTRY["readBalance"] = _read_balance_stub
-TOOL_REGISTRY["transfer"] = _transfer_stub
-
-# =========================
-# Security middleware stub
-# =========================
 class SecurityDecision(BaseModel):
     allowed: bool
-    reason: NotRequired[str]
+    reason: Optional[str] = None
 
 class ToolCallSecurityMiddleware:
-    """
-    Drop-in place to enforce your authorization rules.
-    - Map caller identity -> role/privs
-    - Enforce per-tool policies
-    """
-    def authorize(self, caller_token: str, call: ToolCall) -> SecurityDecision:
-        # TODO: lookup caller_token -> role/privileges
-        # For now, allow ONLY readBalance; deny transfer by default.
+    def authorize(self, caller: AgentIdentity, call: ToolCall) -> SecurityDecision:
+        # readBalance: finance OR (customer_service & assigned)
         if call.tool == "readBalance":
+            uid = call.args.get("user_id")
+            if caller.role == "finance":
+                return SecurityDecision(allowed=True)
+            if caller.role == "customer_service" and uid in caller.assigned_customers:
+                return SecurityDecision(allowed=True)
+            return SecurityDecision(allowed=False, reason=f"{caller.agent_id} not allowed to read {uid}")
+
+        # transfer: finance only
+        if call.tool == "transfer":
+            if caller.role != "finance":
+                return SecurityDecision(allowed=False, reason="only finance can transfer")
             return SecurityDecision(allowed=True)
-        return SecurityDecision(allowed=False, reason="Not permitted in base model")
+
+        # read_ticket_history: customer_service can call for their assigned customers
+        if call.tool == "read_ticket_history":
+            if caller.role == "finance":
+                return SecurityDecision(allowed=True)
+            uid = call.args.get("user_id")
+            if caller.role == "customer_service" and uid in caller.assigned_customers:
+                return SecurityDecision(allowed=True)
+            return SecurityDecision(allowed=False, reason="not allowed to read ticket history")
+
+        # send_email: allow customer_service and finance (internal communications)
+        if call.tool == "send_email":
+            return SecurityDecision(allowed=True)
+
+        return SecurityDecision(allowed=False, reason=f"unknown tool {call.tool}")
 
     def execute(self, call: ToolCall) -> Any:
         if call.tool not in TOOL_REGISTRY:
-            raise ValueError(f"Unknown tool: {call.tool}")
+            raise ValueError(f"Unknown tool {call.tool}")
         return TOOL_REGISTRY[call.tool](call.args)
 
 SECURITY = ToolCallSecurityMiddleware()
 
-# =========================
-# LangGraph State & Nodes
-# =========================
-class LGState(TypedDict, total=False):
+# Public helper for testing (no agents / no graph)
+def call_tool_as(agent_id: str, tool: str, args: Dict[str, Any]) -> Dict[str, Any]:
     """
-    Base state for the graph. Agents are NOT included yet.
-    Extend later with:
-      - caller metadata (role, assigned customers)
-      - conversation messages
-      - audit trail
+    Emulate a tool call originating from an agent identity.
+
+    Returns a normalized dict with either "ok": True and "result", or "error": ...
     """
-    caller_token: str
-    pending_call: Optional[ToolCall]
-    last_result: Optional[Dict[str, Any]]
-    log: List[str]
-
-def _init_state(caller_token: str, pending_call: Optional[ToolCall] = None) -> LGState:
-    return {
-        "caller_token": caller_token,
-        "pending_call": pending_call,
-        "last_result": None,
-        "log": [],
-    }
-
-# Node: router (in a larger system this could choose which agent to run)
-def node_router(state: LGState) -> LGState:
-    log = state.get("log", [])
-    log.append("router: start")
-    state["log"] = log
-    # In the base model, just go to tool_executor if a call exists; otherwise end.
-    return state
-
-# Node: tool_executor (runs through middleware)
-def node_tool_executor(state: LGState) -> LGState:
-    log = state.get("log", [])
-    call: Optional[ToolCall] = state.get("pending_call")
-    if not call:
-        log.append("tool_executor: no pending call")
-        state["log"] = log
-        return state
-
-    # Authorize
-    decision = SECURITY.authorize(state.get("caller_token", ""), call)
+    if agent_id not in IDENTITIES:
+        return {"error": "unknown_agent"}
+    ident = IDENTITIES[agent_id]
+    call = ToolCall(tool=tool, args=args)
+    decision = SECURITY.authorize(ident, call)
     if not decision.allowed:
-        log.append(f"tool_executor: DENY {call.tool} - {decision.reason}")
-        state["last_result"] = {"error": "unauthorized", "reason": decision.reason}
-        state["log"] = log
-        return state
-
-    # Execute
+        return {"error": "unauthorized", "reason": decision.reason}
     try:
-        result = SECURITY.execute(call)
-        log.append(f"tool_executor: OK {call.tool}")
-        state["last_result"] = {"ok": True, "tool": call.tool, "result": result}
+        res = SECURITY.execute(call)
+        return {"ok": True, "tool": tool, "result": res}
     except Exception as e:
-        log.append(f"tool_executor: ERROR {call.tool} - {e}")
-        state["last_result"] = {"error": "exception", "detail": str(e)}
-    state["log"] = log
-    return state
+        return {"error": "exception", "detail": str(e)}
 
-# Graph wiring
-def build_graph():
-    g = StateGraph(LGState)
-    g.add_node("router", node_router)
-    g.add_node("tool_executor", node_tool_executor)
-
-    # Flow: router -> tool_executor -> END
-    g.set_entry_point("router")
-    g.add_edge("router", "tool_executor")
-    g.add_edge("tool_executor", END)
-    return g.compile()
-
-# =========================
-# Simple "get started" run
-# =========================
+#Potential usages. There isn't any agent logic yet. 
 if __name__ == "__main__":
-    app = build_graph()
+    print("=== AgentB reading assigned user1 (allowed) ===")
+    print(call_tool_as("AgentB", "readBalance", {"user_id": "user1"}))
 
-    # Example 1: allowed base call (readBalance is allowed by stub policy)
-    s1 = _init_state(
-        caller_token="token-dev",  # TODO: map to real identities later
-        pending_call=ToolCall(tool="readBalance", args={"user_id": "user2"}),
-    )
-    out1 = app.invoke(s1)
-    print("=== RUN 1 (readBalance) ===")
-    print("last_result:", out1.get("last_result"))
-    print("log:", out1.get("log"))
+    print("\n=== AgentB reading unassigned user4 (DENIED) ===")
+    print(call_tool_as("AgentB", "readBalance", {"user_id": "user4"}))
 
-    # Example 2: denied base call (transfer is denied by stub policy)
-    s2 = _init_state(
-        caller_token="token-dev",
-        pending_call=ToolCall(tool="transfer", args={"from_user": "user1", "to_user": "user2", "amount": 100}),
-    )
-    out2 = app.invoke(s2)
-    print("\n=== RUN 2 (transfer) ===")
-    print("last_result:", out2.get("last_result"))
-    print("log:", out2.get("log"))
+    print("\n=== AgentB reading ticket history for user1 (allowed) ===")
+    print(call_tool_as("AgentB", "read_ticket_history", {"user_id": "user1"}))
+
+    print("\n=== AgentB trying to transfer (injection attempt) (DENIED) ===")
+    print(call_tool_as("AgentB", "transfer", {"from_user": "user1", "to_user": "user2", "amount": 10000.0}))
+
+    print("\n=== AgentA (finance) performing transfer (ALLOWED) ===")
+    print(call_tool_as("AgentA", "transfer", {"from_user": "user1", "to_user": "user2", "amount": 50.0}))
+
+    print("\n=== Balances after AgentA transfer ===")
+    print({k: v.balance for k, v in ACCOUNTS.items()})
