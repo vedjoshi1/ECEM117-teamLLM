@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+from datetime import datetime
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, List, Optional, Literal
 
-from pydantic import BaseModel
+import json
+from pydantic import BaseModel, Field
 from langchain_core.tools import tool
 from langchain.agents import create_agent
 from langchain_core.messages import AIMessage
@@ -86,6 +88,56 @@ def send_email(args: Dict[str, Any]) -> Dict[str, Any]:
     return {"status": "sent", "to": args.get("to"), "subject": args.get("subject")}
 
 
+# --- Cross-agent request forwarding tool (AgentB -> AgentA) ---
+def send_request_agentA(args: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Forward a privileged request to AgentA while preserving provenance/taint.
+    Expected args:
+      - requested_tool: str                # e.g., "transfer", "readBalance"
+      - requested_args: Dict[str, Any]     # args for the requested_tool
+      - original_user_id / original_user_privilege (optional)
+      - provenance_chain (optional)
+
+    Behavior:
+      - Preserves & extends provenance_chain.
+      - Calls call_tool_as("AgentA", requested_tool, requested_args).
+      - Returns AgentA's result (or error) plus forwarding metadata.
+    """
+    requested_tool = args.get("requested_tool")
+    requested_args = dict(args.get("requested_args") or {})
+    if not requested_tool or not isinstance(requested_tool, str):
+        return {"error": "bad_request", "reason": "requested_tool is required"}
+    if not isinstance(requested_args, dict):
+        return {"error": "bad_request", "reason": "requested_args must be a dict"}
+
+    # Whitelist: only allow a set of tools to be forwarded. Adjust as needed.
+    ALLOWED_FORWARD_TOOLS = {"transfer", "readBalance", "read_ticket_history"}
+    if requested_tool not in ALLOWED_FORWARD_TOOLS:
+        return {"error": "unauthorized_forward", "reason": f"cannot forward tool '{requested_tool}'"}
+
+    # Carry provenance + user context forward
+    original_user_id = args.get("original_user_id")
+    original_user_privilege = args.get("original_user_privilege")
+    provenance_chain = list(args.get("provenance_chain") or [])
+    # call_tool_as will append "AgentA" to the provenance automatically
+    requested_args.setdefault("original_user_id", original_user_id)
+    requested_args.setdefault("original_user_privilege", original_user_privilege)
+    requested_args.setdefault("provenance_chain", provenance_chain)
+
+    # Perform the privileged call as AgentA
+    forwarded = call_tool_as("AgentA", requested_tool, requested_args)
+
+    return {
+        "status": "forwarded",
+        "forward_to": "AgentA",
+        "requested_tool": requested_tool,
+        "requested_args": requested_args,
+        "agentA_result": forwarded,
+        "send_request_agentA": send_request_agentA,
+    }
+
+
+
 TOOL_REGISTRY: Dict[str, Callable[[Dict[str, Any]], Any]] = {
     "readBalance": read_balance,
     "transfer": transfer,
@@ -100,6 +152,12 @@ TOOL_REGISTRY: Dict[str, Callable[[Dict[str, Any]], Any]] = {
 class ToolCall(BaseModel):
     tool: str
     args: Dict[str, Any]
+
+    # Provenance / taint metadata ---
+    original_user_id: Optional[str] = None              # the end-user who ultimately initiated the request
+    original_user_privilege: Optional[str] = None       # e.g., "low", "standard", "admin" (placeholder until research defines levels)
+    calling_agent_id: Optional[str] = None              # the immediate agent making the tool call
+    provenance_chain: List[str] = Field(default_factory=list)  # ordered path, e.g., ["User", "AgentB", "AgentA"]
 
 
 class SecurityDecision(BaseModel):
@@ -133,7 +191,17 @@ class ToolCallSecurityMiddleware:
         if call.tool == "send_email":
             return SecurityDecision(allowed=True)
 
+        if call.tool == "send_request_agentA":
+            # Allow customer_service to request AgentA action; finance can use it too (optional).
+            # The forwarded call to AgentA will still be fully authorized by the middleware.
+            if caller.role in ("customer_service", "finance"):
+                return SecurityDecision(allowed=True)
+            return SecurityDecision(allowed=False, reason="not allowed to forward requests to AgentA")
+
         return SecurityDecision(allowed=False, reason=f"unknown tool {call.tool}")
+
+        
+
 
     def execute(self, call: ToolCall) -> Any:
         if call.tool not in TOOL_REGISTRY:
@@ -141,23 +209,149 @@ class ToolCallSecurityMiddleware:
         return TOOL_REGISTRY[call.tool](call.args)
 
 
+class AuditLogger:
+    """
+    Lightweight audit logger that records every tool call decision, including provenance.
+    Stores events in memory and (optionally) appends JSON lines to a file.
+    """
+    def __init__(self, to_file: Optional[str] = None):
+        self.to_file = to_file
+        self._events: List[Dict[str, Any]] = []
+
+    def log(self, **kwargs):
+        event = {
+            "ts": datetime.utcnow().isoformat(timespec="milliseconds") + "Z",
+            **kwargs,
+        }
+        self._events.append(event)
+
+        # Console line for quick visibility
+        print(
+            f"[AUDIT] {event['ts']} agent={kwargs.get('agent_id')} "
+            f"tool={kwargs.get('tool')} allowed={kwargs.get('allowed')} "
+            f"reason={kwargs.get('reason')}"
+        )
+
+        # Optional persistent log
+        if self.to_file:
+            try:
+                with open(self.to_file, "a") as f:
+                    f.write(json.dumps(event) + "\n")
+            except Exception as e:
+                print(f"[AUDIT][WARN] Failed to write audit event: {e}")
+
+    def get_events(self) -> List[Dict[str, Any]]:
+        return list(self._events)
+
+
+# Create a global audit logger; change filename or set to None if you don't want a file.
+AUDIT = AuditLogger(to_file="audit_log.jsonl")
+
+
+
 SECURITY = ToolCallSecurityMiddleware()
 
 
 # Public helper for testing (no agents / no graph)
 def call_tool_as(agent_id: str, tool: str, args: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Executes a tool call on behalf of an agent with:
+      - Step 1: Provenance fields auto-populated if not provided
+      - Step 2: Structured audit logging (pre-/post-decision)
+    """
     if agent_id not in IDENTITIES:
-        return {"error": "unknown_agent"}
+        return {"error": "unknown_agent", "agent_id": agent_id}
+
     ident = IDENTITIES[agent_id]
-    call = ToolCall(tool=tool, args=args)
+
+    # Fill provenance defaults if caller didn't supply them ---
+    original_user_id = args.get("original_user_id") or "demo_user"          # TODO: wire real user identity when available
+    original_user_privilege = args.get("original_user_privilege") or "low"  # TODO: wire real privilege model
+    provenance_chain = list(args.get("provenance_chain") or [])
+    # append current agent to the chain (avoid duplicating if already last)
+    if not provenance_chain or provenance_chain[-1] != agent_id:
+        provenance_chain.append(agent_id)
+
+    call = ToolCall(
+        tool=tool,
+        args=args,
+        original_user_id=original_user_id,
+        original_user_privilege=original_user_privilege,
+        calling_agent_id=agent_id,
+        provenance_chain=provenance_chain,
+    )
+
+    # Authorization
     decision = SECURITY.authorize(ident, call)
+
+    # Audit log (pre-exec / decision) ---
+    AUDIT.log(
+        phase="authorize",
+        agent_id=agent_id,
+        tool=tool,
+        args=args,
+        allowed=decision.allowed,
+        reason=decision.reason,
+        original_user_id=call.original_user_id,
+        original_user_privilege=call.original_user_privilege,
+        provenance_chain=call.provenance_chain,
+    )
+
     if not decision.allowed:
-        return {"error": "unauthorized", "reason": decision.reason}
+        return {
+            "error": "unauthorized",
+            "reason": decision.reason,
+            "agent_id": agent_id,
+            "tool": tool,
+            "provenance_chain": call.provenance_chain,
+        }
+
+    # Execute
     try:
         res = SECURITY.execute(call)
-        return {"ok": True, "tool": tool, "result": res}
+
+        # Audit log (post-exec)
+        AUDIT.log(
+            phase="execute",
+            agent_id=agent_id,
+            tool=tool,
+            args=args,
+            allowed=True,
+            result=res,
+            original_user_id=call.original_user_id,
+            original_user_privilege=call.original_user_privilege,
+            provenance_chain=call.provenance_chain,
+        )
+
+        return {
+            "ok": True,
+            "tool": tool,
+            "result": res,
+            "agent_id": agent_id,
+            "provenance_chain": call.provenance_chain,
+        }
+
     except Exception as e:
-        return {"error": "exception", "detail": str(e)}
+        # Audit log (error)
+        AUDIT.log(
+            phase="execute",
+            agent_id=agent_id,
+            tool=tool,
+            args=args,
+            allowed=True,
+            error=str(e),
+            original_user_id=call.original_user_id,
+            original_user_privilege=call.original_user_privilege,
+            provenance_chain=call.provenance_chain,
+        )
+        return {
+            "error": "tool_execution_error",
+            "message": str(e),
+            "agent_id": agent_id,
+            "tool": tool,
+            "provenance_chain": call.provenance_chain,
+        }
+
 
 
 # LangChain tool wrappers (secured via middleware)
@@ -205,8 +399,34 @@ def send_email_tool(to: str, subject: str) -> str:
     return f"Email sent to {to} with subject '{subject}'."
 
 
+@tool
+def send_request_agentA_tool(requested_tool: str, requested_args_json: str) -> str:
+    """
+    Forward a tool request to AgentA. Use JSON string for requested_args.
+    Example:
+      send_request_agentA_tool("transfer", "{\"from_user\":\"user3\",\"to_user\":\"user4\",\"amount\":100}")
+    """
+    import json as _json  # local import to avoid shadowing
+    try:
+        requested_args = _json.loads(requested_args_json) if requested_args_json else {}
+    except Exception as e:
+        return f"[send_request_agentA] invalid JSON for requested_args: {e}"
+
+    base_args = {
+        "requested_tool": requested_tool,
+        "requested_args": requested_args,
+        # provenance defaults are auto-filled in call_tool_as, but we pass through if present
+        "original_user_id": requested_args.get("original_user_id"),
+        "original_user_privilege": requested_args.get("original_user_privilege"),
+        "provenance_chain": requested_args.get("provenance_chain"),
+    }
+    result = call_tool_as(AGENT_ID, "send_request_agentA", base_args)
+    return f"[send_request_agentA] {result}"
+
+
+
 # Global tool list for agents
-AGENT_TOOLS = [read_balance_tool, transfer_tool, read_ticket_history_tool, send_email_tool]
+AGENT_TOOLS = [read_balance_tool, transfer_tool, read_ticket_history_tool, send_email_tool, send_request_agentA_tool]
 
 
 # Create an LLM agent for a specific agent_id
